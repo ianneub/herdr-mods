@@ -1,0 +1,192 @@
+#!/bin/sh
+# herdr-open code|finder|github: open the focused herdr pane's folder in VS
+# Code, in Finder, or on GitHub. Run by the MenuWidgets hotkeys in Ghostty
+# (Cmd+Shift+E/F/U) and by herdr's prefix+e/f/u.
+#
+# herdr-open code|finder|github --dir <folder> [--machine <name>]: the Herdr
+# app's open-code/open-finder/open-github mods (its own Cmd+Shift+E/F/U) say
+# which folder, and which of its machines (`hc machine ls`) it is on.
+#
+# When the folder is on a server (a saved herdr machine, or, when one is
+# configured, an ssh pane or a Ghostty window ssh'd in and running herdr
+# there), it's the folder the server's herdr has focused: VS Code opens it
+# over Remote-SSH, GitHub opens its origin remote, and Finder can't reach it
+# (a notification says so).
+# Runs detached, so errors go to the log (and a notification).
+#
+# Optional config, ~/.config/herdr-open.conf (sourced as sh):
+#   HOST=myserver                                  # the Remote-SSH host; must match ~/.ssh/config
+#   HOST_NAMES="myserver myserver.example.ts.net 10.0.0.5"  # names an ssh pane or Ghostty title may use for it
+
+LOG=/tmp/herdr-open.log
+HOST=
+HOST_NAMES=
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-open.conf"
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+[ -n "$HOST" ] && [ -z "$HOST_NAMES" ] && HOST_NAMES=$HOST
+HOST_NAMES=$(printf '%s' "$HOST_NAMES" | /usr/bin/tr 'A-Z' 'a-z')
+CODE="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+HERDR="${HERDR_BIN_PATH:-/opt/homebrew/bin/herdr}"
+HC="$HOME/.local/bin/hc"
+GH=/opt/homebrew/bin/gh
+JQ=/usr/bin/jq
+SSH="/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5"
+REMOTE_CWD="~/.local/bin/herdr pane list | jq -r '.result.panes[] | select(.focused) | .foreground_cwd // .cwd'"
+ACTION=$1
+
+log() { printf '%s %s\n' "$(/bin/date '+%F %T')" "$*" >>"$LOG"; }
+notify() { # <message> [title]
+  /usr/bin/osascript -e "display notification \"$1\" with title \"${2:-herdr}\"" >/dev/null 2>&1
+}
+fail() {
+  log "error: $*"
+  notify "$*" "herdr-open $ACTION"
+  exit 1
+}
+first_line() { /usr/bin/head -n 1; }
+# Single-quotes $1 for the remote shell.
+shquote() { printf "'%s'" "$(printf '%s' "$1" | /usr/bin/sed "s/'/'\\\\''/g")"; }
+
+case "$ACTION" in
+  code | finder | github) ;;
+  *) fail "usage: herdr-open code|finder|github" ;;
+esac
+
+# --- Where is the focused folder? Sets remote (an ssh host, or empty for
+# this Mac) and dir.
+remote=
+dir=
+given= # the folder came as --dir
+machine=
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) given=1 dir=$2 && shift 2 ;;
+    --machine) machine=$2 && shift 2 ;;
+    *) fail "unknown argument $1" ;;
+  esac
+done
+
+server_herdr_dir() { # <ssh host>
+  $SSH "$1" "$REMOTE_CWD" 2>>"$LOG" | first_line
+}
+
+# Run by a MenuWidgets hotkey rather than by herdr: no HERDR_* variables,
+# so find what is in front. In order:
+# - A Ghostty window ssh'd into $HOST, running herdr there: herdr titles
+#   its window "{hostname}: {workspace}" with the host its panes run on.
+# - A saved SSH machine selected in the local herdr's sidebar (herdr passes
+#   the key through to those panes, so its own binding can't run there).
+# - Otherwise the local focused pane, carrying on as herdr would.
+if [ -n "$given" ]; then
+  log "$ACTION: herdr-app, dir=${dir:-home} machine=${machine:-none}"
+  if [ -n "$machine" ]; then
+    remote=$("$HC" machine ls --json 2>>"$LOG" | "$JQ" -r --arg n "$machine" '.machines[] | select(.name == $n) | .target')
+    [ -n "$remote" ] || fail "unknown Herdr machine $machine"
+    [ -n "$dir" ] || dir=$($SSH "$remote" pwd 2>>"$LOG")
+  else
+    HERDR_ACTIVE_PANE_CWD=${dir:-$HOME}
+  fi
+elif [ -z "$HERDR_ACTIVE_PANE_ID" ]; then
+  title=$(/usr/bin/osascript -e 'tell application "Ghostty" to get name of focused terminal of selected tab of front window' 2>>"$LOG")
+  title_host=$(printf '%s\n' "$title" | /usr/bin/sed -n 's/^\([^:[:space:]]*\):.*/\1/p' | /usr/bin/sed 's/^.*@//' | /usr/bin/tr 'A-Z' 'a-z')
+  STATE="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/client"
+  machine=$("$JQ" -r '.selected_profile | if type == "object" then .id else . end // empty' \
+    "$STATE/endpoint-selection.json" 2>>"$LOG")
+  log "$ACTION: hotkey, title=$title machine=${machine:-none}"
+  if [ -n "$machine" ]; then
+    remote=$("$JQ" -r --arg id "$machine" '.ssh[] | select(.id == $id or .label == $id) | .target' \
+      "$STATE/endpoints.json" 2>>"$LOG")
+    [ -n "$remote" ] || fail "unknown herdr machine $machine"
+    dir=$("$HERDR" --machine "$machine" pane list 2>>"$LOG" |
+      "$JQ" -r '.result.panes[] | select(.focused) | .foreground_cwd // .cwd' | first_line)
+  elif [ -n "$HOST" ] && [ -n "$title_host" ]; then
+    for name in $HOST_NAMES; do
+      if [ "$title_host" = "$name" ]; then
+        remote=$HOST
+        dir=$(server_herdr_dir "$HOST")
+        break
+      fi
+    done
+  fi
+  if [ -z "$remote" ]; then
+    focused=$("$HERDR" pane list 2>>"$LOG" |
+      "$JQ" -r '.result.panes[] | select(.focused) | [.pane_id, (.foreground_cwd // .cwd)] | @tsv' | first_line)
+    [ -n "$focused" ] || fail "herdr isn't running or has no focused pane"
+    HERDR_ACTIVE_PANE_ID=$(printf '%s' "$focused" | /usr/bin/cut -f1)
+    HERDR_ACTIVE_PANE_CWD=$(printf '%s' "$focused" | /usr/bin/cut -f2-)
+  fi
+fi
+
+# A local pane: is its foreground process ssh to $HOST (the first
+# argument that isn't an option or an option's value) or herdr --remote?
+if [ -z "$remote" ] && [ -z "$given" ] && [ -n "$HOST" ]; then
+  log "$ACTION: pane=$HERDR_ACTIVE_PANE_ID cwd=${HERDR_ACTIVE_PANE_CWD:-?}"
+  is_host=$(
+    "$HERDR" pane process-info --pane "$HERDR_ACTIVE_PANE_ID" 2>>"$LOG" | "$JQ" -r --arg names "$HOST_NAMES" '
+      def ssh_dest:
+        .[1:] as $a
+        | reduce range(0; $a | length) as $i ({skip: false, dest: null};
+            if .dest != null then .
+            elif .skip then .skip = false
+            elif $a[$i] == "--" then .
+            elif ($a[$i] | startswith("-")) then
+              .skip = ($a[$i] | test("^-[46AaCfGgKkMNnqsTtVvXxYy]*[BbcDEeFIiJLlmOoPpQRSWw]$"))
+            else .dest = $a[$i] end)
+        | .dest // "";
+      def herdr_remote:
+        . as $a | [range(1; length) | select($a[.] == "--remote") | $a[. + 1] // ""] | first // "";
+      [.result.process_info.foreground_processes[]?.argv
+       | select(type == "array" and length > 0)
+       | (.[0] | split("/") | last) as $cmd
+       | if $cmd == "ssh" then ssh_dest elif $cmd == "herdr" then herdr_remote else empty end
+       | ascii_downcase
+       | sub("^ssh://"; "") | sub("^.*@"; "") | sub(":[0-9]+$"; "")
+       | . as $h | select($names | split(" ") | map(select(. != "")) | index($h))]
+      | length > 0' 2>>"$LOG"
+  )
+  if [ "$is_host" = true ]; then
+    remote=$HOST
+    dir=$(server_herdr_dir "$HOST")
+  fi
+fi
+
+# --- This Mac: exactly the commands herdr's bindings ran before.
+if [ -z "$remote" ]; then
+  cd "${HERDR_ACTIVE_PANE_CWD:-.}" 2>/dev/null
+  case "$ACTION" in
+    code) exec /usr/bin/open -a 'Visual Studio Code' "${HERDR_ACTIVE_PANE_CWD:-.}" 2>>"$LOG" ;;
+    finder) exec /usr/bin/open "${HERDR_ACTIVE_PANE_CWD:-.}" 2>>"$LOG" ;;
+    github)
+      "$GH" browse >>"$LOG" 2>&1 || notify "No GitHub repository in this pane"
+      exit 0
+      ;;
+  esac
+fi
+
+# --- A folder on the server.
+[ -n "$dir" ] || fail "couldn't get the focused folder from $remote's herdr"
+log "$ACTION: $remote:$dir"
+case "$ACTION" in
+  code)
+    "$CODE" --remote "ssh-remote+$remote" "$dir" >>"$LOG" 2>&1 || fail "VS Code failed to open $remote:$dir"
+    ;;
+  finder)
+    notify "Finder can't open folders on $remote ($dir)"
+    ;;
+  github)
+    # What gh browse opens: the repository's page, from its origin remote.
+    url=$($SSH "$remote" "git -C $(shquote "$dir") remote get-url origin" 2>>"$LOG" | first_line)
+    page=$(printf '%s\n' "$url" | /usr/bin/sed -n -E \
+      -e 's#^(git@|ssh://git@)github\.com[:/]([^/]+/[^/]+)/?$#https://github.com/\2#p' \
+      -e 's#^https://([^@/]+@)?github\.com/([^/]+/[^/]+)/?$#https://github.com/\2#p' |
+      first_line | /usr/bin/sed 's#\.git$##')
+    if [ -n "$page" ]; then
+      /usr/bin/open "$page"
+    else
+      log "github: origin=${url:-none}"
+      notify "No GitHub repository in this pane"
+    fi
+    ;;
+esac
